@@ -178,8 +178,17 @@ def run(datadir: Path, outfile: Path):
         sys.exit("easyocr 미설치. `pip install -r requirements.txt` 후 다시 실행하세요.")
 
     labels = json.loads(labels_path.read_text(encoding="utf-8"))
-    print(f"OCR 엔진 로딩 중... (최초 1회 모델 다운로드)")
-    reader = easyocr.Reader(["ko"], gpu=False)
+
+    # GPU가 있으면 쓰고 없으면 CPU (로컬=CPU, Colab T4=GPU 자동 전환)
+    try:
+        import torch
+
+        use_gpu = torch.cuda.is_available()
+    except ImportError:
+        use_gpu = False
+
+    print(f"OCR 엔진 로딩 중... ({'GPU' if use_gpu else 'CPU'}, 최초 1회 모델 다운로드)")
+    reader = easyocr.Reader(["ko"], gpu=use_gpu)
 
     rows = []
     for fname, meta in sorted(labels.items()):
