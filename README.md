@@ -25,7 +25,14 @@ pip install -r requirements.txt
 ```bash
 python poc.py gen        # 합성 답안 샘플 12건 + 정답 라벨 생성
 python poc.py run        # OCR 실행 → 정확도 리포트 출력
-python poc.py selfcheck  # 지표/후처리 로직 self-test
+python poc.py selfcheck  # 지표/후처리/파싱 로직 self-test
+```
+
+**OCR 엔진 교체** — 같은 벤치마크로 모델을 비교할 수 있다. GPU는 자동 감지된다.
+
+```bash
+python poc.py run --engine easyocr   # 기본값
+python poc.py run --engine surya     # pip install surya-ocr 필요
 ```
 
 > 손글씨 사진이 없어도 바로 돌아간다. `gen` 이 한글 폰트로 답안 이미지를 만들고 **정답 라벨까지 자동 생성**하기 때문이다.

@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import warnings
+from html import unescape
 from pathlib import Path
 
 warnings.filterwarnings("ignore")  # easyocr/torch 의 pin_memory 경고 억제
@@ -140,6 +141,59 @@ def postcorrect(text: str) -> str:
     return text
 
 
+# ── OCR 엔진 ────────────────────────────────────────────────────────
+def _gpu_available() -> bool:
+    """GPU가 있으면 쓰고 없으면 CPU (로컬=CPU, Colab T4=GPU 자동 전환)."""
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+def _surya_text(result) -> str:
+    """surya 결과에서 평문 추출.
+
+    버전에 따라 blocks(html) 또는 text_lines(text) 형태로 나뉘어 둘 다 처리한다.
+    """
+    blocks = getattr(result, "blocks", None)
+    if blocks:
+        raw = " ".join(getattr(b, "html", "") or "" for b in blocks)
+        return unescape(re.sub(r"<[^>]+>", " ", raw))
+    lines = getattr(result, "text_lines", None) or []
+    return " ".join(getattr(ln, "text", "") or "" for ln in lines)
+
+
+def make_reader(engine: str):
+    """엔진 이름 → `이미지경로 -> 텍스트` 함수를 돌려준다."""
+    gpu = _gpu_available()
+    print(f"OCR 엔진 로딩 중: {engine} ({'GPU' if gpu else 'CPU'})")
+
+    if engine == "easyocr":
+        try:
+            import easyocr
+        except ImportError:
+            sys.exit("easyocr 미설치. `pip install easyocr` 후 다시 실행하세요.")
+        reader = easyocr.Reader(["ko"], gpu=gpu)
+        # 영역별로 쪼개 반환되므로 좌→우 순으로 이어붙임
+        return lambda p: " ".join(reader.readtext(str(p), detail=0))
+
+    if engine == "surya":
+        try:
+            from surya.inference import SuryaInferenceManager
+            from surya.recognition import RecognitionPredictor
+        except ImportError:
+            sys.exit("surya 미설치. `pip install surya-ocr` 후 다시 실행하세요.")
+        from PIL import Image
+
+        predictor = RecognitionPredictor(SuryaInferenceManager())
+        # surya 는 언어 지정이 필요 없다 (91개 언어 자동 인식)
+        return lambda p: _surya_text(predictor([Image.open(p)])[0])
+
+    sys.exit(f"알 수 없는 엔진: {engine} (easyocr | surya)")
+
+
 def edit_distance(a: str, b: str) -> int:
     """레벤슈타인 거리 (CER 계산용)."""
     if a == b:
@@ -166,29 +220,14 @@ def cer(ref: str, hyp: str) -> float:
     return edit_distance(ref, hyp) / len(ref)
 
 
-def run(datadir: Path, outfile: Path):
+def run(datadir: Path, outfile: Path, engine: str = "easyocr"):
     """OCR 실행 → 샘플별 결과와 집계 지표를 마크다운 리포트로 저장."""
     labels_path = datadir / "labels.json"
     if not labels_path.exists():
         sys.exit(f"{labels_path} 가 없습니다. 먼저 `python poc.py gen` 을 실행하세요.")
 
-    try:
-        import easyocr
-    except ImportError:
-        sys.exit("easyocr 미설치. `pip install -r requirements.txt` 후 다시 실행하세요.")
-
     labels = json.loads(labels_path.read_text(encoding="utf-8"))
-
-    # GPU가 있으면 쓰고 없으면 CPU (로컬=CPU, Colab T4=GPU 자동 전환)
-    try:
-        import torch
-
-        use_gpu = torch.cuda.is_available()
-    except ImportError:
-        use_gpu = False
-
-    print(f"OCR 엔진 로딩 중... ({'GPU' if use_gpu else 'CPU'}, 최초 1회 모델 다운로드)")
-    reader = easyocr.Reader(["ko"], gpu=use_gpu)
+    reader = make_reader(engine)
 
     rows = []
     for fname, meta in sorted(labels.items()):
@@ -198,9 +237,8 @@ def run(datadir: Path, outfile: Path):
             print(f"  건너뜀 (파일 없음): {fname}")
             continue
 
-        # easyocr 는 영역별로 쪼개 반환 → 좌→우 순으로 이어붙임
         t0 = time.perf_counter()
-        raw = norm(" ".join(reader.readtext(str(img_path), detail=0)))
+        raw = norm(reader(img_path))
         elapsed = time.perf_counter() - t0
         fixed = norm(postcorrect(raw))
         rows.append(
@@ -234,7 +272,8 @@ def run(datadir: Path, outfile: Path):
     lines = [
         "# OCR 정확도 리포트",
         "",
-        f"대상: `{datadir}` ({n}건)",
+        f"- 엔진: **{engine}**",
+        f"- 대상: `{datadir}` ({n}건)",
         "",
         "## 요약 — 후처리 전/후 비교",
         "",
@@ -306,6 +345,25 @@ def selfcheck():
     assert postcorrect("서울에 간다") == "서울에 간다", "'울'은 '올'이 아니므로 무관"
     assert postcorrect("올해는 춥다") == "올해는 춥다", "어절 끝이 아닌 '올'은 유지"
     assert postcorrect("한다") == "한다"
+
+    # surya 결과 파싱 (엔진 미설치 상태에서도 검증되도록 가짜 객체 사용)
+    class _B:
+        def __init__(self, html):
+            self.html = html
+
+    class _R:
+        def __init__(self, blocks=None, text_lines=None):
+            self.blocks, self.text_lines = blocks, text_lines
+
+    assert norm(_surya_text(_R(blocks=[_B("<p>안녕</p>"), _B("<p>하세요</p>")]))) == "안녕 하세요"
+    assert norm(_surya_text(_R(blocks=[_B("<p>&lt;답안&gt;</p>")]))) == "<답안>", "HTML 엔티티 복원"
+
+    class _L:
+        def __init__(self, text):
+            self.text = text
+
+    assert norm(_surya_text(_R(text_lines=[_L("가나"), _L("다라")]))) == "가나 다라", "구버전 형태"
+    assert norm(_surya_text(_R())) == "", "빈 결과"
     print("selfcheck 통과")
 
 
@@ -320,6 +378,7 @@ if __name__ == "__main__":
     r = sub.add_parser("run", help="OCR 실행 및 정확도 리포트")
     r.add_argument("--data", type=Path, default=DEFAULT_DATA)
     r.add_argument("--out", type=Path, default=ROOT / "results" / "report.md")
+    r.add_argument("--engine", choices=["easyocr", "surya"], default="easyocr")
 
     sub.add_parser("selfcheck", help="지표 계산 self-test")
 
@@ -327,6 +386,6 @@ if __name__ == "__main__":
     if a.cmd == "gen":
         gen(a.out, a.seed)
     elif a.cmd == "run":
-        run(a.data, a.out)
+        run(a.data, a.out, a.engine)
     else:
         selfcheck()
