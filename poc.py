@@ -180,16 +180,31 @@ def make_reader(engine: str):
         return lambda p: " ".join(reader.readtext(str(p), detail=0))
 
     if engine == "surya":
+        # surya 는 언어 지정이 필요 없다 (다국어 자동 인식).
+        # 다만 버전에 따라 초기화 방식이 완전히 다르므로 둘 다 지원한다.
+        from PIL import Image
+
+        # 0.20+ : 추론 백엔드 매니저 기반 (vLLM/llama.cpp 등 외부 백엔드 필요)
         try:
             from surya.inference import SuryaInferenceManager
             from surya.recognition import RecognitionPredictor
+
+            predictor = RecognitionPredictor(SuryaInferenceManager())
+            return lambda p: _surya_text(predictor([Image.open(p)])[0])
+        except ImportError:
+            pass
+
+        # ~0.17.x : FoundationPredictor + DetectionPredictor 로 인프로세스 추론
+        try:
+            from surya.detection import DetectionPredictor
+            from surya.foundation import FoundationPredictor
+            from surya.recognition import RecognitionPredictor
         except ImportError:
             sys.exit("surya 미설치. `pip install surya-ocr` 후 다시 실행하세요.")
-        from PIL import Image
 
-        predictor = RecognitionPredictor(SuryaInferenceManager())
-        # surya 는 언어 지정이 필요 없다 (91개 언어 자동 인식)
-        return lambda p: _surya_text(predictor([Image.open(p)])[0])
+        rec = RecognitionPredictor(FoundationPredictor())
+        det = DetectionPredictor()
+        return lambda p: _surya_text(rec([Image.open(p)], det_predictor=det)[0])
 
     sys.exit(f"알 수 없는 엔진: {engine} (easyocr | surya)")
 
