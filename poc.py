@@ -165,6 +165,68 @@ def _surya_text(result) -> str:
     return " ".join(getattr(ln, "text", "") or "" for ln in lines)
 
 
+def _clova_text(payload: dict) -> str:
+    """CLOVA OCR 응답에서 인식 텍스트를 좌→우 순으로 이어붙인다.
+
+    응답 구조: images[].fields[].inferText
+    fields 에는 줄바꿈 여부(lineBreak)가 있으나 우리는 한 줄 이미지만 넣으므로 무시한다.
+    """
+    out = []
+    for img in payload.get("images", []):
+        for f in img.get("fields", []):
+            t = f.get("inferText", "")
+            if t:
+                out.append(t)
+    return " ".join(out)
+
+
+def _make_clova_reader():
+    """CLOVA OCR(네이버 클라우드) 어댑터.
+
+    키는 환경변수로만 받는다 — 저장소에 절대 커밋하지 않는다.
+      CLOVA_OCR_URL     APIGW Invoke URL
+      CLOVA_OCR_SECRET  Secret Key
+    """
+    import base64
+    import json as _json
+    import os
+    import urllib.request
+
+    url = os.environ.get("CLOVA_OCR_URL", "").strip()
+    secret = os.environ.get("CLOVA_OCR_SECRET", "").strip()
+    if not url or not secret:
+        sys.exit(
+            "CLOVA 키가 없습니다. 환경변수를 설정하세요:\n"
+            '  $env:CLOVA_OCR_URL = "<APIGW Invoke URL>"\n'
+            '  $env:CLOVA_OCR_SECRET = "<Secret Key>"'
+        )
+
+    def read(path) -> str:
+        path = Path(path)
+        body = {
+            "version": "V1",
+            "requestId": path.name,
+            "timestamp": 0,
+            "lang": "ko",
+            "images": [
+                {
+                    "format": path.suffix.lstrip(".").lower() or "png",
+                    "name": path.stem,
+                    "data": base64.b64encode(path.read_bytes()).decode(),
+                }
+            ],
+        }
+        req = urllib.request.Request(
+            url,
+            data=_json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", "X-OCR-SECRET": secret},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return _clova_text(_json.loads(resp.read().decode()))
+
+    return read
+
+
 def make_reader(engine: str):
     """엔진 이름 → `이미지경로 -> 텍스트` 함수를 돌려준다."""
     gpu = _gpu_available()
@@ -206,7 +268,10 @@ def make_reader(engine: str):
         det = DetectionPredictor()
         return lambda p: _surya_text(rec([Image.open(p)], det_predictor=det)[0])
 
-    sys.exit(f"알 수 없는 엔진: {engine} (easyocr | surya)")
+    if engine == "clova":
+        return _make_clova_reader()
+
+    sys.exit(f"알 수 없는 엔진: {engine} (easyocr | surya | clova)")
 
 
 def edit_distance(a: str, b: str) -> int:
@@ -450,6 +515,22 @@ def selfcheck():
 
     assert norm(_surya_text(_R(text_lines=[_L("가나"), _L("다라")]))) == "가나 다라", "구버전 형태"
     assert norm(_surya_text(_R())) == "", "빈 결과"
+
+    # CLOVA 응답 파싱 (키·네트워크 없이 검증)
+    clova = {
+        "images": [
+            {
+                "fields": [
+                    {"inferText": "기출문제를", "inferConfidence": 0.99},
+                    {"inferText": "다", "inferConfidence": 0.98},
+                    {"inferText": "푼", "inferConfidence": 0.97},
+                ]
+            }
+        ]
+    }
+    assert _clova_text(clova) == "기출문제를 다 푼"
+    assert _clova_text({"images": [{"fields": []}]}) == "", "빈 인식 결과"
+    assert _clova_text({}) == "", "이미지 없음"
     print("selfcheck 통과")
 
 
@@ -464,7 +545,9 @@ if __name__ == "__main__":
     r = sub.add_parser("run", help="OCR 실행 및 정확도 리포트")
     r.add_argument("--data", type=Path, default=DEFAULT_DATA)
     r.add_argument("--out", type=Path, default=ROOT / "results" / "report.md")
-    r.add_argument("--engine", choices=["easyocr", "surya"], default="easyocr")
+    r.add_argument(
+        "--engine", choices=["easyocr", "surya", "clova"], default="easyocr"
+    )
 
     sub.add_parser("selfcheck", help="지표 계산 self-test")
 
