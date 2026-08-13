@@ -187,6 +187,31 @@ def _clova_text(payload: dict) -> str:
     return " ".join(_clova_image_text(img) for img in payload.get("images", []))
 
 
+def _paddle_text(result) -> str:
+    """PaddleOCR 결과에서 평문 추출.
+
+    3.x 는 [{'rec_texts': [...]}] 형태, 2.x 는 [[[box, (text, conf)], ...]] 형태로
+    구조가 완전히 다르므로 둘 다 처리한다.
+    """
+    if not result:
+        return ""
+    # 3.x: 페이지별 dict
+    if isinstance(result[0], dict):
+        out = []
+        for page in result:
+            out.extend(page.get("rec_texts") or [])
+        return " ".join(out)
+    # 2.x: 중첩 리스트
+    out = []
+    for page in result:
+        for item in page or []:
+            try:
+                out.append(item[1][0])
+            except (IndexError, TypeError, KeyError):
+                continue
+    return " ".join(out)
+
+
 class ClovaError(RuntimeError):
     """CLOVA API 호출 실패 (응답 본문 포함)."""
 
@@ -339,10 +364,28 @@ def make_reader(engine: str):
         det = DetectionPredictor()
         return lambda p: _surya_text(rec([Image.open(p)], det_predictor=det)[0])
 
+    if engine == "paddle":
+        try:
+            from paddleocr import PaddleOCR
+        except ImportError:
+            sys.exit(
+                "paddleocr 미설치. Linux 환경에서:\n"
+                "  pip install paddlepaddle paddleocr"
+            )
+        # 생성자 인자도 버전마다 달라 최소 인자로 만든다
+        ocr = PaddleOCR(lang="korean")
+        use_predict = hasattr(ocr, "predict")
+
+        def read(p):
+            r = ocr.predict(str(p)) if use_predict else ocr.ocr(str(p))
+            return _paddle_text(r)
+
+        return read
+
     if engine == "clova":
         return _make_clova_reader()
 
-    sys.exit(f"알 수 없는 엔진: {engine} (easyocr | surya | clova)")
+    sys.exit(f"알 수 없는 엔진: {engine} (easyocr | surya | clova | paddle)")
 
 
 def edit_distance(a: str, b: str) -> int:
@@ -925,6 +968,12 @@ def selfcheck():
     assert norm(_surya_text(_R(text_lines=[_L("가나"), _L("다라")]))) == "가나 다라", "구버전 형태"
     assert norm(_surya_text(_R())) == "", "빈 결과"
 
+    # PaddleOCR 응답 파싱 — 3.x(dict) / 2.x(중첩 리스트) 양쪽
+    assert _paddle_text([{"rec_texts": ["기출", "문제를"]}]) == "기출 문제를"
+    assert _paddle_text([[[[0, 0], ("가나", 0.9)], [[1, 1], ("다라", 0.8)]]]) == "가나 다라"
+    assert _paddle_text([]) == "" and _paddle_text(None) == ""
+    assert _paddle_text([{"rec_texts": None}]) == "", "빈 인식 결과"
+
     # CLOVA 응답 파싱 (키·네트워크 없이 검증)
     clova = {
         "images": [
@@ -963,7 +1012,7 @@ if __name__ == "__main__":
     r.add_argument("--data", type=Path, default=DEFAULT_DATA)
     r.add_argument("--out", type=Path, default=ROOT / "results" / "report.md")
     r.add_argument(
-        "--engine", choices=["easyocr", "surya", "clova"], default="easyocr"
+        "--engine", choices=["easyocr", "surya", "clova", "paddle"], default="easyocr"
     )
 
     pc = sub.add_parser("pagecompare", help="페이지 통째 vs 행별 분할 비교")
@@ -976,7 +1025,7 @@ if __name__ == "__main__":
     )
     pc.add_argument("--out", type=Path, default=ROOT / "results" / "pagecompare.md")
     pc.add_argument(
-        "--engine", choices=["easyocr", "surya", "clova"], default="clova"
+        "--engine", choices=["easyocr", "surya", "clova", "paddle"], default="clova"
     )
 
     bt = sub.add_parser("batchtest", help="CLOVA: 여러 장을 1회 요청으로 (images 배열)")
