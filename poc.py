@@ -180,6 +180,37 @@ def _clova_text(payload: dict) -> str:
     return " ".join(out)
 
 
+class ClovaError(RuntimeError):
+    """CLOVA API 호출 실패 (응답 본문 포함)."""
+
+
+def _clova_post(url: str, secret: str, body: dict, timeout: int = 120) -> dict:
+    """CLOVA API 호출. 오류 시 응답 본문을 함께 보여준다.
+
+    HTTPError 는 본문에 원인(메시지·필드명)을 담아 오므로 버리지 않고 출력한다.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        data=_json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "X-OCR-SECRET": secret},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = (e.read() or b"").decode("utf-8", "replace")[:600]
+        payload_mb = len(_json.dumps(body).encode()) / 1048576
+        raise ClovaError(
+            f"CLOVA API 오류 {e.code} {e.reason}\n"
+            f"    요청 크기 {payload_mb:.1f}MB / 이미지 {len(body.get('images', []))}장\n"
+            f"    응답 본문: {detail}"
+        ) from None
+
+
 def clova_batch(paths: list) -> list:
     """여러 이미지를 한 번의 CLOVA 호출로 처리한다.
 
@@ -210,13 +241,7 @@ def clova_batch(paths: list) -> list:
             for p in paths
         ],
     }
-    req = urllib.request.Request(
-        url,
-        data=_json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "X-OCR-SECRET": secret},
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        payload = _json.loads(resp.read().decode())
+    payload = _clova_post(url, secret, body)
 
     # 이미지별로 분리해 반환 (images 배열 순서 = 요청 순서)
     return [
@@ -261,13 +286,10 @@ def _make_clova_reader():
                 }
             ],
         }
-        req = urllib.request.Request(
-            url,
-            data=_json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", "X-OCR-SECRET": secret},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return _clova_text(_json.loads(resp.read().decode()))
+        try:
+            return _clova_text(_clova_post(url, secret, body, timeout=30))
+        except ClovaError as e:
+            sys.exit(str(e))
 
     return read
 
@@ -650,7 +672,26 @@ def batchtest(datadir: Path, outfile: Path):
     if missing:
         sys.exit(f"전면 이미지 없음: {missing} — `python prepare_real.py` 를 먼저 실행하세요.")
 
-    print(f"배치 호출: 이미지 {len(paths)}장을 1회 요청으로 전송 중...")
+    # 장수를 1→N 으로 늘려가며 어디서 깨지는지 확인한다.
+    # (한 번에 실패하면 "장수 제한"인지 "요청 크기 초과"인지 구분할 수 없다)
+    print("배치 가능 장수 탐색 중...")
+    ok = 0
+    for k in range(1, len(paths) + 1):
+        mb = sum(p.stat().st_size for p in paths[:k]) * 4 / 3 / 1048576  # base64 팽창분
+        try:
+            texts_k = clova_batch(paths[:k])
+            ok = k
+            print(f"  {k}장 (~{mb:.1f}MB): 성공 — 응답 {len(texts_k)}건")
+        except ClovaError as e:
+            print(f"  {k}장 (~{mb:.1f}MB): 실패\n    {e}")
+            break
+
+    if ok == 0:
+        sys.exit("1장도 실패했습니다. 키·URL 을 확인하세요.")
+    if ok < len(paths):
+        print(f"\n→ 최대 {ok}장까지 한 요청으로 가능. {ok}장 기준으로 측정합니다.")
+
+    paths = paths[:ok]
     t0 = time.perf_counter()
     texts = clova_batch(paths)
     sec = time.perf_counter() - t0
