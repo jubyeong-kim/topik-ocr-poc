@@ -7,3 +7,4 @@ venv/
 data/real/*
 !data/real/.gitkeep
 _merged.jpg
+_scaled.jpg

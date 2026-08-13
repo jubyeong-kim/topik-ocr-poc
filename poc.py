@@ -661,19 +661,56 @@ def pagecompare(datadir: Path, lines_json: Path, outfile: Path, engine: str):
     print(f"리포트 → {outfile}")
 
 
-def mergetest(datadir: Path, outfile: Path):
-    """페이지 5장을 세로로 이어 **1장**으로 만들어 1회 호출.
+SCALES = [1.0, 0.7, 0.5, 0.35, 0.25, 0.15]
 
-    배치(images 배열)는 API 가 1장만 허용해 불가능했다. 병합은 '이미지 1장'이므로
-    그 제약은 피하지만, 해상도가 커져 축소되면 글자가 뭉개질 수 있다.
-    """
-    from PIL import Image
 
+def _page_texts(datadir: Path) -> dict:
+    """페이지별 정답 텍스트 (행 전사를 순서대로 이어붙임)."""
     labels = json.loads((datadir / "labels.json").read_text(encoding="utf-8"))
     pages: dict[str, list] = {}
     for fname, meta in sorted(labels.items()):
         pages.setdefault(fname.split("_")[0], []).append(meta["text"])
+    return {k: " ".join(v) for k, v in pages.items()}
 
+
+def _measure_scaled(img, ref: str, scales: list, tag: str, tmp: Path) -> list:
+    """이미지를 여러 배율로 줄여가며 CER 을 잰다. 실패도 결과로 기록한다."""
+    from PIL import Image
+
+    rows = []
+    for s in scales:
+        w, h = int(img.size[0] * s), int(img.size[1] * s)
+        scaled = img if s == 1.0 else img.resize((w, h), Image.LANCZOS)
+        scaled.save(tmp, quality=95)
+        mb = tmp.stat().st_size / 1048576
+
+        t0 = time.perf_counter()
+        try:
+            hyp = norm(postcorrect(clova_batch([tmp])[0]))
+            err = None
+        except ClovaError as e:
+            hyp, err = "", str(e).split("\n")[0]
+        sec = time.perf_counter() - t0
+
+        c = cer(ref, hyp) if hyp else 1.0
+        rows.append(
+            {"scale": s, "w": w, "h": h, "mb": mb, "cer": c, "sec": sec, "err": err}
+        )
+        status = err if err else ("결과 없음" if not hyp else f"CER {c:.3f}")
+        print(f"  {tag} {s:>4.0%} {w}x{h} ({mb:.1f}MB): {status}")
+    return rows
+
+
+def mergetest(datadir: Path, outfile: Path):
+    """축소율에 따른 인식률 곡선을 잰다 — 병합본과 단일 페이지 양쪽.
+
+    병합이 원본 크기에서 실패했다고 "병합 불가"로 단정할 수 없다. 어디까지 줄이면
+    통과하는지, 그때 정확도가 어떤지를 재야 판단할 수 있다.
+    단일 페이지도 함께 재서 **해상도 한계선**을 분리해 본다.
+    """
+    from PIL import Image
+
+    pages = _page_texts(datadir)
     paths = [datadir / f"{s}_page.jpg" for s in sorted(pages)]
     if any(not p.exists() for p in paths):
         sys.exit("전면 이미지가 없습니다 — `python prepare_real.py` 를 먼저 실행하세요.")
@@ -686,44 +723,63 @@ def mergetest(datadir: Path, outfile: Path):
         merged.paste(i, (0, y))
         y += i.size[1]
 
-    mpath = datadir / "_merged.jpg"
-    merged.save(mpath, quality=95)
-    mb = mpath.stat().st_size / 1048576
-    print(f"병합 이미지: {W}x{H} / {mb:.1f}MB (base64 ~{mb * 4 / 3:.1f}MB) → 1회 호출")
+    tmp = datadir / "_scaled.jpg"
+    ref_all = norm(" ".join(pages[s] for s in sorted(pages)))
 
-    t0 = time.perf_counter()
-    try:
-        texts = clova_batch([mpath])
-    except ClovaError as e:
-        sys.exit(f"병합 호출 실패 — 이 방식은 쓸 수 없습니다.\n{e}")
-    sec = time.perf_counter() - t0
+    print(f"[1] 병합 5장 ({W}x{H}) — 축소율별")
+    merged_rows = _measure_scaled(merged, ref_all, SCALES, "병합", tmp)
 
-    # 5장 전체 정답을 순서대로 이어붙여 비교
-    ref = norm(" ".join(" ".join(pages[s]) for s in sorted(pages)))
-    hyp = norm(postcorrect(texts[0] if texts else ""))
-    c = cer(ref, hyp)
-    c_ns = cer_nospace(ref, hyp)
+    stem = sorted(pages)[0]
+    print(f"\n[2] 단일 페이지 {stem} — 축소율별 (해상도 한계선 확인)")
+    single_rows = _measure_scaled(
+        imgs[0], norm(pages[stem]), SCALES, "단일", tmp
+    )
+    tmp.unlink(missing_ok=True)
+
+    def table(rows):
+        out = ["| 배율 | 크기 | 용량 | CER | 비고 |", "|------|------|------|-----|------|"]
+        for r in rows:
+            note = r["err"][:60] if r["err"] else ("인식 0건" if r["cer"] >= 1.0 else "")
+            out.append(
+                f"| {r['scale']:.0%} | {r['w']}x{r['h']} | {r['mb']:.1f}MB "
+                f"| {r['cer']:.3f} | {note} |"
+            )
+        return out
+
+    ok = [r for r in merged_rows if r["cer"] < 1.0]
+    best = min(ok, key=lambda r: r["cer"]) if ok else None
 
     lines = [
-        "# CLOVA 병합 이미지 실험 (5페이지 → 1장)",
+        "# 축소율에 따른 인식률 — 병합본 vs 단일 페이지",
         "",
-        f"- 병합 크기: **{W}x{H}** ({mb:.1f}MB)",
-        f"- 호출: **1회**, {sec:.1f}초",
-        f"- 평균 CER: **{c:.3f}** (띄어쓰기 무시 {c_ns:.3f})",
+        "병합이 원본 크기에서 실패했다고 병합 자체가 불가한 것은 아니다.",
+        "**어디까지 줄이면 통과하는지, 그때 정확도가 어떤지**를 측정했다.",
+        "",
+        f"## 1. 병합 5장 ({W}x{H} 원본)",
+        "",
+        *table(merged_rows),
+        "",
+        f"## 2. 단일 페이지 {stem} ({imgs[0].size[0]}x{imgs[0].size[1]} 원본)",
+        "",
+        *table(single_rows),
+        "",
+        "## 기준선",
         "",
         "| 방식 | 호출 | CER |",
         "|------|------|-----|",
         "| 행별 분할 | 53회 | 0.073 |",
-        "| 페이지별 | 5회 | **0.037** |",
-        f"| 병합 1장 | **1회** | {c:.3f} |",
-        "",
-        f"인식 결과 앞부분: `{hyp[:400]}`",
+        "| 페이지별 (원본) | 5회 | **0.037** |",
     ]
+    if best:
+        lines.append(
+            f"| 병합 1장 (최적 {best['scale']:.0%}) | **1회** | {best['cer']:.3f} |"
+        )
+    else:
+        lines.append("| 병합 1장 | 1회 | 모든 배율에서 실패 |")
+
     outfile.parent.mkdir(parents=True, exist_ok=True)
     outfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    print(f"병합 CER {c:.3f} (띄어쓰기 무시 {c_ns:.3f}) / 페이지별 0.037 대비")
-    print(f"리포트 → {outfile}")
+    print(f"\n리포트 → {outfile}")
 
 
 def batchtest(datadir: Path, outfile: Path):
