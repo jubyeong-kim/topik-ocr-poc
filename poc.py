@@ -657,6 +657,71 @@ def pagecompare(datadir: Path, lines_json: Path, outfile: Path, engine: str):
     print(f"리포트 → {outfile}")
 
 
+def mergetest(datadir: Path, outfile: Path):
+    """페이지 5장을 세로로 이어 **1장**으로 만들어 1회 호출.
+
+    배치(images 배열)는 API 가 1장만 허용해 불가능했다. 병합은 '이미지 1장'이므로
+    그 제약은 피하지만, 해상도가 커져 축소되면 글자가 뭉개질 수 있다.
+    """
+    from PIL import Image
+
+    labels = json.loads((datadir / "labels.json").read_text(encoding="utf-8"))
+    pages: dict[str, list] = {}
+    for fname, meta in sorted(labels.items()):
+        pages.setdefault(fname.split("_")[0], []).append(meta["text"])
+
+    paths = [datadir / f"{s}_page.jpg" for s in sorted(pages)]
+    if any(not p.exists() for p in paths):
+        sys.exit("전면 이미지가 없습니다 — `python prepare_real.py` 를 먼저 실행하세요.")
+
+    imgs = [Image.open(p) for p in paths]
+    W, H = max(i.size[0] for i in imgs), sum(i.size[1] for i in imgs)
+    merged = Image.new("RGB", (W, H), (205, 205, 205))
+    y = 0
+    for i in imgs:
+        merged.paste(i, (0, y))
+        y += i.size[1]
+
+    mpath = datadir / "_merged.jpg"
+    merged.save(mpath, quality=95)
+    mb = mpath.stat().st_size / 1048576
+    print(f"병합 이미지: {W}x{H} / {mb:.1f}MB (base64 ~{mb * 4 / 3:.1f}MB) → 1회 호출")
+
+    t0 = time.perf_counter()
+    try:
+        texts = clova_batch([mpath])
+    except ClovaError as e:
+        sys.exit(f"병합 호출 실패 — 이 방식은 쓸 수 없습니다.\n{e}")
+    sec = time.perf_counter() - t0
+
+    # 5장 전체 정답을 순서대로 이어붙여 비교
+    ref = norm(" ".join(" ".join(pages[s]) for s in sorted(pages)))
+    hyp = norm(postcorrect(texts[0] if texts else ""))
+    c = cer(ref, hyp)
+    c_ns = cer_nospace(ref, hyp)
+
+    lines = [
+        "# CLOVA 병합 이미지 실험 (5페이지 → 1장)",
+        "",
+        f"- 병합 크기: **{W}x{H}** ({mb:.1f}MB)",
+        f"- 호출: **1회**, {sec:.1f}초",
+        f"- 평균 CER: **{c:.3f}** (띄어쓰기 무시 {c_ns:.3f})",
+        "",
+        "| 방식 | 호출 | CER |",
+        "|------|------|-----|",
+        "| 행별 분할 | 53회 | 0.073 |",
+        "| 페이지별 | 5회 | **0.037** |",
+        f"| 병합 1장 | **1회** | {c:.3f} |",
+        "",
+        f"인식 결과 앞부분: `{hyp[:400]}`",
+    ]
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    outfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    print(f"병합 CER {c:.3f} (띄어쓰기 무시 {c_ns:.3f}) / 페이지별 0.037 대비")
+    print(f"리포트 → {outfile}")
+
+
 def batchtest(datadir: Path, outfile: Path):
     """CLOVA: 페이지 5장을 한 요청(images 배열)으로 보내 개별 호출과 비교.
 
@@ -828,6 +893,10 @@ if __name__ == "__main__":
     bt.add_argument("--data", type=Path, default=ROOT / "data" / "real")
     bt.add_argument("--out", type=Path, default=ROOT / "results" / "batchtest_clova.md")
 
+    mt = sub.add_parser("mergetest", help="CLOVA: 5장을 1장으로 병합해 1회 호출")
+    mt.add_argument("--data", type=Path, default=ROOT / "data" / "real")
+    mt.add_argument("--out", type=Path, default=ROOT / "results" / "mergetest_clova.md")
+
     sub.add_parser("selfcheck", help="지표 계산 self-test")
 
     a = p.parse_args()
@@ -839,5 +908,7 @@ if __name__ == "__main__":
         pagecompare(a.data, a.lines, a.out, a.engine)
     elif a.cmd == "batchtest":
         batchtest(a.data, a.out)
+    elif a.cmd == "mergetest":
+        mergetest(a.data, a.out)
     else:
         selfcheck()

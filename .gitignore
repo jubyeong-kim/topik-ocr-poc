@@ -6,3 +6,4 @@ venv/
 # 실제 손글씨 사진은 개인 필적이므로 커밋하지 않는다 (labels.json 은 예시로 허용)
 data/real/*
 !data/real/.gitkeep
+_merged.jpg
