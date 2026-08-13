@@ -847,6 +847,52 @@ def mergetest(datadir: Path, outfile: Path):
     print(f"\n리포트 → {outfile}")
 
 
+def recheck(datadir: Path, stored: Path, n: int, outfile: Path):
+    """같은 이미지를 다시 보내 저장된 결과와 대조 — OCR 이 결정적인가.
+
+    "OCR 은 LLM 과 달리 항상 같은 결과를 낸다"는 전제 위에 앙상블·재현성 논의가
+    서 있다. 그 전제 자체를 확인한 적이 없어 검증한다.
+    """
+    rows = json.loads(stored.read_text(encoding="utf-8"))[:n]
+    reader = make_reader("clova")
+
+    same = 0
+    lines = [
+        "# CLOVA 결정성 검증",
+        "",
+        f"같은 이미지 {len(rows)}건을 다시 호출해 이전 결과와 대조했다.",
+        "",
+        "| 파일 | 동일 | 이전 결과 | 이번 결과 |",
+        "|------|------|-----------|-----------|",
+    ]
+    for r in rows:
+        p = datadir / r["file"]
+        if not p.exists():
+            print(f"  건너뜀: {r['file']}")
+            continue
+        now = norm(reader(p))
+        before = norm(r["hyp"])
+        ok = now == before
+        same += ok
+        print(f"  [{'=' if ok else '≠'}] {r['file']}")
+        lines.append(
+            f"| {r['file']} | {'✅' if ok else '❌'} | {before[:40]} | "
+            f"{'(동일)' if ok else now[:40]} |"
+        )
+
+    total = len([r for r in rows if (datadir / r["file"]).exists()])
+    verdict = (
+        "**결정적이다.** 같은 입력에 같은 출력이 보장된다."
+        if same == total
+        else f"**비결정적이다.** {total - same}건이 달라졌다 — 재채점 시 결과가 바뀔 수 있다."
+    )
+    lines += ["", f"동일: **{same}/{total}**", "", verdict]
+
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    outfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\n동일 {same}/{total} → {outfile}")
+
+
 def trimtest(datadir: Path, outfile: Path):
     """여백 제거가 단일 페이지 인식률에 도움이 되는가.
 
@@ -1120,6 +1166,12 @@ if __name__ == "__main__":
         "--engine", choices=["easyocr", "surya", "clova", "paddle"], default="clova"
     )
 
+    rc = sub.add_parser("recheck", help="CLOVA 결정성 검증 (같은 이미지 재호출)")
+    rc.add_argument("--data", type=Path, default=ROOT / "data" / "real")
+    rc.add_argument("--stored", type=Path, default=ROOT / "results" / "report_real_clova.json")
+    rc.add_argument("-n", type=int, default=10, help="검사할 이미지 수")
+    rc.add_argument("--out", type=Path, default=ROOT / "results" / "recheck_clova.md")
+
     tt = sub.add_parser("trimtest", help="여백 제거가 단일 페이지에 도움 되는지")
     tt.add_argument("--data", type=Path, default=ROOT / "data" / "real")
     tt.add_argument("--out", type=Path, default=ROOT / "results" / "trimtest_clova.md")
@@ -1141,6 +1193,8 @@ if __name__ == "__main__":
         run(a.data, a.out, a.engine)
     elif a.cmd == "pagecompare":
         pagecompare(a.data, a.lines, a.out, a.engine)
+    elif a.cmd == "recheck":
+        recheck(a.data, a.stored, a.n, a.out)
     elif a.cmd == "trimtest":
         trimtest(a.data, a.out)
     elif a.cmd == "batchtest":
