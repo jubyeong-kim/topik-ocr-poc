@@ -715,7 +715,21 @@ def mergetest(datadir: Path, outfile: Path):
     if any(not p.exists() for p in paths):
         sys.exit("전면 이미지가 없습니다 — `python prepare_real.py` 를 먼저 실행하세요.")
 
-    imgs = [Image.open(p) for p in paths]
+    # 여백 제거 후 병합 — 페이지 아래쪽 빈 공간이 전체 높이의 절반가량이다.
+    # 크기가 줄어 제한을 통과할 가능성이 커지고, 축소하더라도 같은 목표 크기에
+    # 더 큰 배율을 쓸 수 있어 글자 해상도가 그만큼 보존된다.
+    from prepare_real import text_line_bands
+
+    print("여백 제거 중...")
+    imgs = []
+    for p in paths:
+        im = Image.open(p)
+        bands = text_line_bands(im)
+        y0 = max(0, bands[0][0] - 40)
+        y1 = min(im.size[1], bands[-1][1] + 40)
+        imgs.append(im.crop((0, y0, im.size[0], y1)))
+        print(f"  {p.name}: {im.size[1]} → {y1 - y0}px")
+
     W, H = max(i.size[0] for i in imgs), sum(i.size[1] for i in imgs)
     merged = Image.new("RGB", (W, H), (205, 205, 205))
     y = 0
@@ -726,14 +740,13 @@ def mergetest(datadir: Path, outfile: Path):
     tmp = datadir / "_scaled.jpg"
     ref_all = norm(" ".join(pages[s] for s in sorted(pages)))
 
-    print(f"[1] 병합 5장 ({W}x{H}) — 축소율별")
+    print(f"\n[1] 병합 5장 (여백 제거 {W}x{H}) — 축소율별")
     merged_rows = _measure_scaled(merged, ref_all, SCALES, "병합", tmp)
 
+    # 단일 페이지도 같은 방식(여백 제거)으로 재야 비교가 성립한다
     stem = sorted(pages)[0]
-    print(f"\n[2] 단일 페이지 {stem} — 축소율별 (해상도 한계선 확인)")
-    single_rows = _measure_scaled(
-        imgs[0], norm(pages[stem]), SCALES, "단일", tmp
-    )
+    print(f"\n[2] 단일 페이지 {stem} ({imgs[0].size[0]}x{imgs[0].size[1]}) — 해상도 한계선")
+    single_rows = _measure_scaled(imgs[0], norm(pages[stem]), SCALES, "단일", tmp)
     tmp.unlink(missing_ok=True)
 
     def table(rows):
@@ -755,11 +768,20 @@ def mergetest(datadir: Path, outfile: Path):
         "병합이 원본 크기에서 실패했다고 병합 자체가 불가한 것은 아니다.",
         "**어디까지 줄이면 통과하는지, 그때 정확도가 어떤지**를 측정했다.",
         "",
-        f"## 1. 병합 5장 ({W}x{H} 원본)",
+        "### 전처리: 여백 제거",
+        "",
+        "페이지 아래쪽 빈 공간이 전체 높이의 절반가량이다. 글자 영역만 잘라 병합하면",
+        "**병합 높이가 20160 → 10199px (51%)** 로 줄어든다.",
+        "크기 제한을 통과할 가능성이 커지고, 축소하더라도 같은 목표 크기에 더 큰 배율을",
+        "쓸 수 있어 글자 해상도가 보존된다. 검출 비용은 5장에 약 10초로 무시할 수준이다.",
+        "",
+        f"## 1. 병합 5장 — 여백 제거 후 {W}x{H}",
+        "",
+        f"(여백 포함 원본 3024x20160 은 **CER 1.000, 인식 0건**으로 실패했다)",
         "",
         *table(merged_rows),
         "",
-        f"## 2. 단일 페이지 {stem} ({imgs[0].size[0]}x{imgs[0].size[1]} 원본)",
+        f"## 2. 단일 페이지 {stem} — 여백 제거 후 {imgs[0].size[0]}x{imgs[0].size[1]}",
         "",
         *table(single_rows),
         "",
