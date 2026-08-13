@@ -248,6 +248,29 @@ def cer_nospace(ref: str, hyp: str) -> float:
     return edit_distance(ref, hyp) / len(ref)
 
 
+SHORT_LINE_CHARS = 10  # 이보다 짧은 행은 CER 이 극단적으로 튀어 대표성이 없다
+
+
+def _short_line_note(rows: list) -> str:
+    """짧은 단편 행을 제외한 CER 을 함께 보고한다.
+
+    "다." 같은 2~3글자 행은 한 글자만 틀려도 CER 이 1.0 이 되어 평균을 왜곡한다.
+    TOPIK 답안 행으로서 대표성도 없으므로 제외값을 병기한다 (제외 대상은 명시).
+    """
+    short = [r for r in rows if len(r["ref"]) < SHORT_LINE_CHARS]
+    if not short:
+        return f"({SHORT_LINE_CHARS}자 미만 단편 없음)"
+    keep = [r for r in rows if len(r["ref"]) >= SHORT_LINE_CHARS]
+    if not keep:
+        return "(모든 행이 단편이라 보정값을 낼 수 없음)"
+    adj = sum(r["cer"] for r in keep) / len(keep)
+    names = ", ".join(f"`{r['file']}`({r['ref']})" for r in short)
+    return (
+        f"**{SHORT_LINE_CHARS}자 미만 단편 {len(short)}건 제외 시 평균 CER: {adj:.3f}** "
+        f"({len(keep)}행 기준) — 제외 대상: {names}"
+    )
+
+
 def run(datadir: Path, outfile: Path, engine: str = "easyocr"):
     """OCR 실행 → 샘플별 결과와 집계 지표를 마크다운 리포트로 저장."""
     labels_path = datadir / "labels.json"
@@ -319,8 +342,10 @@ def run(datadir: Path, outfile: Path, engine: str = "easyocr"):
         f"| 완전 일치율 | - | {exact}/{n} ({exact / n:.0%}) | - |",
         f"| 평균 CER (띄어쓰기 무시) | - | {avg_cer_ns:.3f} | 참고 지표 |",
         "",
+        _short_line_note(rows),
+        "",
         f"이미지 1장당 평균 처리 시간: **{sum(r['sec'] for r in rows) / n:.2f}초** "
-        f"(CPU 전용, 모델 로딩 제외)",
+        f"({'GPU' if _gpu_available() else 'CPU'}, 모델 로딩 제외)",
         "",
     ]
 
