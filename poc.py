@@ -235,6 +235,19 @@ def cer(ref: str, hyp: str) -> float:
     return edit_distance(ref, hyp) / len(ref)
 
 
+def cer_nospace(ref: str, hyp: str) -> float:
+    """띄어쓰기를 무시한 문자 오류율.
+
+    TOPIK 은 띄어쓰기도 채점 대상이라 기본 CER 에는 공백을 포함한다.
+    다만 OCR 실패가 띄어쓰기에 몰릴 때 '글자 자체를 얼마나 읽었는가'를
+    분리해서 보기 위한 보조 지표.
+    """
+    ref, hyp = ref.replace(" ", ""), hyp.replace(" ", "")
+    if not ref:
+        return 0.0 if not hyp else 1.0
+    return edit_distance(ref, hyp) / len(ref)
+
+
 def run(datadir: Path, outfile: Path, engine: str = "easyocr"):
     """OCR 실행 → 샘플별 결과와 집계 지표를 마크다운 리포트로 저장."""
     labels_path = datadir / "labels.json"
@@ -266,6 +279,7 @@ def run(datadir: Path, outfile: Path, engine: str = "easyocr"):
                 "sec": elapsed,
                 "cer_raw": cer(ref, raw),
                 "cer": cer(ref, fixed),
+                "cer_ns": cer_nospace(ref, fixed),
                 "ok_raw": ref.replace(" ", "") == raw.replace(" ", ""),
                 "exact": norm(ref) == fixed,
                 "exact_nospace": ref.replace(" ", "") == fixed.replace(" ", ""),
@@ -280,9 +294,15 @@ def run(datadir: Path, outfile: Path, engine: str = "easyocr"):
     n = len(rows)
     cer_raw = sum(r["cer_raw"] for r in rows) / n
     avg_cer = sum(r["cer"] for r in rows) / n
+    avg_cer_ns = sum(r["cer_ns"] for r in rows) / n
     ok_raw = sum(r["ok_raw"] for r in rows)
     exact = sum(r["exact"] for r in rows)
     exact_ns = sum(r["exact_nospace"] for r in rows)
+
+    # 필체(그룹)별 집계 — 표본이 한 사람에 치우쳤는지, 편차가 얼마인지 보기 위함
+    groups: dict[str, list] = {}
+    for r in rows:
+        groups.setdefault(r["font"], []).append(r)
 
     lines = [
         "# OCR 정확도 리포트",
@@ -297,10 +317,36 @@ def run(datadir: Path, outfile: Path, engine: str = "easyocr"):
         f"| 평균 CER (낮을수록 좋음) | {cer_raw:.3f} | **{avg_cer:.3f}** | 0.15 이하 |",
         f"| 공백 무시 일치율 | {ok_raw}/{n} ({ok_raw / n:.0%}) | **{exact_ns}/{n} ({exact_ns / n:.0%})** | 80% 이상 |",
         f"| 완전 일치율 | - | {exact}/{n} ({exact / n:.0%}) | - |",
+        f"| 평균 CER (띄어쓰기 무시) | - | {avg_cer_ns:.3f} | 참고 지표 |",
         "",
         f"이미지 1장당 평균 처리 시간: **{sum(r['sec'] for r in rows) / n:.2f}초** "
         f"(CPU 전용, 모델 로딩 제외)",
         "",
+    ]
+
+    if len(groups) > 1:
+        lines += [
+            "## 필체별 집계",
+            "",
+            "| 필체 | 행 수 | 평균 CER | CER(공백무시) | 일치 |",
+            "|------|-------|----------|---------------|------|",
+        ]
+        for g, rs in sorted(groups.items()):
+            m = len(rs)
+            lines.append(
+                f"| {g} | {m} | {sum(x['cer'] for x in rs) / m:.3f} "
+                f"| {sum(x['cer_ns'] for x in rs) / m:.3f} "
+                f"| {sum(x['exact_nospace'] for x in rs)}/{m} |"
+            )
+        spread = [sum(x["cer"] for x in rs) / len(rs) for rs in groups.values()]
+        lines += [
+            "",
+            f"필체 간 CER 편차: **{min(spread):.3f} ~ {max(spread):.3f}** "
+            f"(최대/최소 {max(spread) / max(min(spread), 1e-9):.1f}배)",
+            "",
+        ]
+
+    lines += [
         "## 샘플별 결과",
         "",
         "| 파일 | 폰트 | 정답 | OCR 원본 | 후처리 후 | CER | 일치 |",
