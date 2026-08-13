@@ -180,6 +180,51 @@ def _clova_text(payload: dict) -> str:
     return " ".join(out)
 
 
+def clova_batch(paths: list) -> list:
+    """여러 이미지를 한 번의 CLOVA 호출로 처리한다.
+
+    API 가 images 배열을 받으므로, 이미지를 병합해 해상도를 희생하지 않고도
+    호출 수를 줄일 수 있다. 반환은 입력 순서대로의 텍스트 리스트.
+    """
+    import base64
+    import json as _json
+    import os
+    import urllib.request
+
+    url = os.environ.get("CLOVA_OCR_URL", "").strip()
+    secret = os.environ.get("CLOVA_OCR_SECRET", "").strip()
+    if not url or not secret:
+        sys.exit("CLOVA_OCR_URL / CLOVA_OCR_SECRET 환경변수가 필요합니다.")
+
+    body = {
+        "version": "V1",
+        "requestId": "batch",
+        "timestamp": 0,
+        "lang": "ko",
+        "images": [
+            {
+                "format": Path(p).suffix.lstrip(".").lower() or "jpg",
+                "name": Path(p).stem,
+                "data": base64.b64encode(Path(p).read_bytes()).decode(),
+            }
+            for p in paths
+        ],
+    }
+    req = urllib.request.Request(
+        url,
+        data=_json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "X-OCR-SECRET": secret},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        payload = _json.loads(resp.read().decode())
+
+    # 이미지별로 분리해 반환 (images 배열 순서 = 요청 순서)
+    return [
+        norm(" ".join(f.get("inferText", "") for f in img.get("fields", [])))
+        for img in payload.get("images", [])
+    ]
+
+
 def _make_clova_reader():
     """CLOVA OCR(네이버 클라우드) 어댑터.
 
@@ -590,6 +635,62 @@ def pagecompare(datadir: Path, lines_json: Path, outfile: Path, engine: str):
     print(f"리포트 → {outfile}")
 
 
+def batchtest(datadir: Path, outfile: Path):
+    """CLOVA: 페이지 5장을 한 요청(images 배열)으로 보내 개별 호출과 비교.
+
+    정확도가 같다면 호출 수를 5회 → 1회로 더 줄일 수 있다.
+    """
+    labels = json.loads((datadir / "labels.json").read_text(encoding="utf-8"))
+    pages: dict[str, list] = {}
+    for fname, meta in sorted(labels.items()):
+        pages.setdefault(fname.split("_")[0], []).append(meta["text"])
+
+    paths = [datadir / f"{s}_page.jpg" for s in sorted(pages)]
+    missing = [p.name for p in paths if not p.exists()]
+    if missing:
+        sys.exit(f"전면 이미지 없음: {missing} — `python prepare_real.py` 를 먼저 실행하세요.")
+
+    print(f"배치 호출: 이미지 {len(paths)}장을 1회 요청으로 전송 중...")
+    t0 = time.perf_counter()
+    texts = clova_batch(paths)
+    sec = time.perf_counter() - t0
+
+    if len(texts) != len(paths):
+        sys.exit(
+            f"응답 이미지 수 불일치: 요청 {len(paths)} / 응답 {len(texts)}. "
+            "배치가 지원되지 않을 수 있습니다."
+        )
+
+    rows = []
+    for stem, path, hyp in zip(sorted(pages), paths, texts):
+        ref = norm(" ".join(pages[stem]))
+        rows.append({"page": stem, "cer": cer(ref, norm(postcorrect(hyp)))})
+        print(f"  {stem}: CER {rows[-1]['cer']:.3f}")
+
+    avg = sum(r["cer"] for r in rows) / len(rows)
+    lines = [
+        "# CLOVA 배치 호출 실험 (images 배열)",
+        "",
+        f"이미지 {len(paths)}장을 **1회 요청**으로 전송. 총 소요 {sec:.1f}초.",
+        "",
+        "| 페이지 | CER (배치) |",
+        "|--------|------------|",
+    ]
+    lines += [f"| {r['page']} | {r['cer']:.3f} |" for r in rows]
+    lines += [
+        "",
+        f"평균 CER: **{avg:.3f}**",
+        "",
+        "개별 호출(5회) 결과는 [pagecompare_clova.md](pagecompare_clova.md) 참조.",
+        "두 값이 같다면 호출 수를 5회 → 1회로 더 줄일 수 있다.",
+    ]
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    outfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    print(f"\n배치 평균 CER {avg:.3f} | 총 {sec:.1f}초 (1회 호출)")
+    print(f"리포트 → {outfile}")
+
+
 def selfcheck():
     """지표 계산 로직 검증."""
     assert edit_distance("가나다", "가나다") == 0
@@ -682,6 +783,10 @@ if __name__ == "__main__":
         "--engine", choices=["easyocr", "surya", "clova"], default="clova"
     )
 
+    bt = sub.add_parser("batchtest", help="CLOVA: 여러 장을 1회 요청으로 (images 배열)")
+    bt.add_argument("--data", type=Path, default=ROOT / "data" / "real")
+    bt.add_argument("--out", type=Path, default=ROOT / "results" / "batchtest_clova.md")
+
     sub.add_parser("selfcheck", help="지표 계산 self-test")
 
     a = p.parse_args()
@@ -691,5 +796,7 @@ if __name__ == "__main__":
         run(a.data, a.out, a.engine)
     elif a.cmd == "pagecompare":
         pagecompare(a.data, a.lines, a.out, a.engine)
+    elif a.cmd == "batchtest":
+        batchtest(a.data, a.out)
     else:
         selfcheck()
