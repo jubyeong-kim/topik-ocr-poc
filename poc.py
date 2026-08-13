@@ -165,19 +165,26 @@ def _surya_text(result) -> str:
     return " ".join(getattr(ln, "text", "") or "" for ln in lines)
 
 
-def _clova_text(payload: dict) -> str:
-    """CLOVA OCR 응답에서 인식 텍스트를 좌→우 순으로 이어붙인다.
+def _clova_image_text(img: dict) -> str:
+    """CLOVA 응답의 이미지 1건에서 텍스트 추출. 처리 실패는 조용히 넘기지 않는다.
 
-    응답 구조: images[].fields[].inferText
-    fields 에는 줄바꿈 여부(lineBreak)가 있으나 우리는 한 줄 이미지만 넣으므로 무시한다.
+    HTTP 200 이어도 이미지별로 실패할 수 있고(inferResult=FAILURE), 그때 fields 가
+    비어 빈 문자열이 된다. "못 읽은 것"과 "처리에 실패한 것"은 구분해야 한다.
     """
-    out = []
-    for img in payload.get("images", []):
-        for f in img.get("fields", []):
-            t = f.get("inferText", "")
-            if t:
-                out.append(t)
-    return " ".join(out)
+    result = img.get("inferResult")
+    if result and result != "SUCCESS":
+        raise ClovaError(
+            f"이미지 처리 실패: inferResult={result} "
+            f"message={img.get('message', '(없음)')}"
+        )
+    return " ".join(
+        t for f in img.get("fields", []) if (t := f.get("inferText", ""))
+    )
+
+
+def _clova_text(payload: dict) -> str:
+    """CLOVA OCR 응답에서 인식 텍스트를 좌→우 순으로 이어붙인다."""
+    return " ".join(_clova_image_text(img) for img in payload.get("images", []))
 
 
 class ClovaError(RuntimeError):
@@ -244,10 +251,7 @@ def clova_batch(paths: list) -> list:
     payload = _clova_post(url, secret, body)
 
     # 이미지별로 분리해 반환 (images 배열 순서 = 요청 순서)
-    return [
-        norm(" ".join(f.get("inferText", "") for f in img.get("fields", [])))
-        for img in payload.get("images", [])
-    ]
+    return [norm(_clova_image_text(img)) for img in payload.get("images", [])]
 
 
 def _make_clova_reader():
@@ -858,6 +862,14 @@ def selfcheck():
     assert _clova_text(clova) == "기출문제를 다 푼"
     assert _clova_text({"images": [{"fields": []}]}) == "", "빈 인식 결과"
     assert _clova_text({}) == "", "이미지 없음"
+
+    # 처리 실패(inferResult != SUCCESS)는 빈 문자열이 아니라 예외로 드러나야 한다
+    try:
+        _clova_text({"images": [{"inferResult": "FAILURE", "message": "too large"}]})
+        raise AssertionError("처리 실패가 조용히 넘어감")
+    except ClovaError as e:
+        assert "FAILURE" in str(e) and "too large" in str(e)
+    assert _clova_text({"images": [{"inferResult": "SUCCESS", "fields": [{"inferText": "가"}]}]}) == "가"
     print("selfcheck 통과")
 
 
