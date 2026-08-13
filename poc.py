@@ -465,8 +465,128 @@ def run(datadir: Path, outfile: Path, engine: str = "easyocr"):
     outfile.parent.mkdir(parents=True, exist_ok=True)
     outfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    # 행별 원시 결과를 함께 남긴다 — pagecompare 가 재호출 없이 재사용한다
+    outfile.with_suffix(".json").write_text(
+        json.dumps(
+            [{"file": r["file"], "ref": r["ref"], "hyp": r["hyp"]} for r in rows],
+            ensure_ascii=False,
+            indent=1,
+        ),
+        encoding="utf-8",
+    )
+
     print(f"\n평균 CER  {cer_raw:.3f} → {avg_cer:.3f}")
     print(f"일치율    {ok_raw}/{n} → {exact_ns}/{n}  (후처리 전 → 후)")
+    print(f"리포트 → {outfile}")
+
+
+def pagecompare(datadir: Path, lines_json: Path, outfile: Path, engine: str):
+    """페이지 통째로 1회 호출 vs 행별 여러 회 호출을 페이지 단위 CER 로 비교.
+
+    행별 결과는 앞선 `run` 이 남긴 JSON 을 재사용하므로 추가 호출이 없다.
+    페이지 쪽만 이미지 수만큼(=5회) 호출한다.
+    """
+    if not lines_json.exists():
+        sys.exit(
+            f"{lines_json} 가 없습니다.\n"
+            f"먼저 행별 측정을 실행하세요: python poc.py run --data {datadir} --engine {engine}"
+        )
+
+    rows = json.loads(lines_json.read_text(encoding="utf-8"))
+    pages: dict[str, list] = {}
+    for r in rows:
+        pages.setdefault(r["file"].split("_")[0], []).append(r)
+
+    reader = make_reader(engine)
+    out = []
+    for stem, rs in sorted(pages.items()):
+        img = datadir / f"{stem}_page.jpg"
+        if not img.exists():
+            print(f"  건너뜀 (전면 이미지 없음): {img.name}")
+            continue
+
+        ref = norm(" ".join(r["ref"] for r in rs))
+        by_line = norm(" ".join(r["hyp"] for r in rs))
+
+        t0 = time.perf_counter()
+        whole = norm(postcorrect(reader(img)))
+        sec = time.perf_counter() - t0
+
+        out.append(
+            {
+                "page": stem,
+                "n_lines": len(rs),
+                "cer_line": cer(ref, by_line),
+                "cer_page": cer(ref, whole),
+                "cer_line_ns": cer_nospace(ref, by_line),
+                "cer_page_ns": cer_nospace(ref, whole),
+                "sec": sec,
+                "whole": whole,
+                "ref": ref,
+            }
+        )
+        r = out[-1]
+        print(
+            f"  {stem}: 행별 CER {r['cer_line']:.3f} → 페이지 CER {r['cer_page']:.3f} "
+            f"({sec:.1f}초)"
+        )
+
+    if not out:
+        sys.exit("비교할 페이지가 없습니다. `python prepare_real.py` 를 먼저 실행하세요.")
+
+    n = len(out)
+    calls_line = sum(r["n_lines"] for r in out)
+    avg_l = sum(r["cer_line"] for r in out) / n
+    avg_p = sum(r["cer_page"] for r in out) / n
+    avg_l_ns = sum(r["cer_line_ns"] for r in out) / n
+    avg_p_ns = sum(r["cer_page_ns"] for r in out) / n
+
+    lines = [
+        f"# 페이지 통째 vs 행별 분할 비교 — {engine}",
+        "",
+        f"같은 정답·같은 엔진으로 **입력 단위만** 바꿔 측정했다. 대상 {n}페이지.",
+        "",
+        "| 항목 | 행별 분할 | 페이지 통째 |",
+        "|------|-----------|-------------|",
+        f"| API 호출 수 | {calls_line}회 | **{n}회** ({calls_line / n:.1f}배 절감) |",
+        f"| 평균 CER | {avg_l:.3f} | {avg_p:.3f} |",
+        f"| 평균 CER (띄어쓰기 무시) | {avg_l_ns:.3f} | {avg_p_ns:.3f} |",
+        "",
+        "## 페이지별",
+        "",
+        "| 페이지 | 행 수 | 행별 CER | 페이지 CER | 차이 | 페이지 처리시간 |",
+        "|--------|-------|----------|------------|------|-----------------|",
+    ]
+    for r in out:
+        d = r["cer_page"] - r["cer_line"]
+        lines.append(
+            f"| {r['page']} | {r['n_lines']} | {r['cer_line']:.3f} | {r['cer_page']:.3f} "
+            f"| {d:+.3f} | {r['sec']:.1f}초 |"
+        )
+
+    better = sum(1 for r in out if r["cer_page"] < r["cer_line"])
+    lines += [
+        "",
+        f"페이지 통째가 더 정확한 경우: **{better}/{n}**",
+        "",
+        "## 페이지 통째 인식 결과 (원문 대조)",
+        "",
+    ]
+    for r in out:
+        lines += [
+            f"### {r['page']}",
+            "",
+            f"- 정답: `{r['ref'][:300]}`",
+            f"- 결과: `{r['whole'][:300]}`",
+            "",
+        ]
+
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    outfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    print(f"\n호출 수  {calls_line}회 → {n}회 ({calls_line / n:.1f}배 절감)")
+    print(f"평균 CER {avg_l:.3f} (행별) vs {avg_p:.3f} (페이지)")
+    print(f"페이지가 더 정확: {better}/{n}")
     print(f"리포트 → {outfile}")
 
 
@@ -549,6 +669,19 @@ if __name__ == "__main__":
         "--engine", choices=["easyocr", "surya", "clova"], default="easyocr"
     )
 
+    pc = sub.add_parser("pagecompare", help="페이지 통째 vs 행별 분할 비교")
+    pc.add_argument("--data", type=Path, default=ROOT / "data" / "real")
+    pc.add_argument(
+        "--lines",
+        type=Path,
+        required=True,
+        help="앞선 run 이 남긴 행별 결과 JSON (예: results/report_real_clova.json)",
+    )
+    pc.add_argument("--out", type=Path, default=ROOT / "results" / "pagecompare.md")
+    pc.add_argument(
+        "--engine", choices=["easyocr", "surya", "clova"], default="clova"
+    )
+
     sub.add_parser("selfcheck", help="지표 계산 self-test")
 
     a = p.parse_args()
@@ -556,5 +689,7 @@ if __name__ == "__main__":
         gen(a.out, a.seed)
     elif a.cmd == "run":
         run(a.data, a.out, a.engine)
+    elif a.cmd == "pagecompare":
+        pagecompare(a.data, a.lines, a.out, a.engine)
     else:
         selfcheck()

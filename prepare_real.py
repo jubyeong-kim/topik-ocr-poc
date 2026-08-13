@@ -19,7 +19,7 @@ import argparse
 import json
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 SOURCE_BASE = (
     "https://raw.githubusercontent.com/Nexdata-AI/"
@@ -128,15 +128,18 @@ def text_line_bands(
 
 
 def remove_annotation_boxes(im: Image.Image) -> Image.Image:
-    """초록 어노테이션 박스를 배경색으로 지운다 (OCR 교란 요인 제거)."""
+    """초록 어노테이션 박스를 배경색으로 지운다 (OCR 교란 요인 제거).
+
+    조건은 g > r+40 and g > b+40. 픽셀 단위 파이썬 루프 대신 채널 연산으로 처리한다
+    (전면 페이지는 1200만 픽셀이라 루프로는 수 분이 걸린다).
+    """
     im = im.convert("RGB")
-    px = im.load()
-    w, h = im.size
-    for y in range(h):
-        for x in range(w):
-            r, g, b = px[x, y]
-            if g > r + 40 and g > b + 40:
-                px[x, y] = (205, 205, 205)
+    r, g, b = im.split()
+    # ImageChops.subtract 는 0 에서 클리핑되므로 g-r, g-b 가 40 초과인 화소만 남는다
+    over_r = ImageChops.subtract(g, r).point(lambda v: 255 if v > 40 else 0)
+    over_b = ImageChops.subtract(g, b).point(lambda v: 255 if v > 40 else 0)
+    mask = ImageChops.logical_and(over_r.convert("1"), over_b.convert("1"))
+    im.paste((205, 205, 205), mask=mask)
     return im
 
 
@@ -165,6 +168,10 @@ def process(name: str, texts: list[str], labels: dict, detect_only: bool) -> Non
         fname = f"{stem}_line{i:02d}.png"
         remove_annotation_boxes(crop).save(REAL_DIR / fname)
         labels[fname] = {"text": text, "font": f"실제손글씨-{stem}"}
+
+    # 페이지 통째 비교(pagecompare)용 — 행 크롭과 동일하게 박스를 지운 전면 이미지.
+    # PNG 로 두면 8~9MB 라 base64 전송 시 API 크기 제한에 걸린다 → 고품질 JPEG.
+    remove_annotation_boxes(im).save(REAL_DIR / f"{stem}_page.jpg", quality=95)
 
 
 def main():
