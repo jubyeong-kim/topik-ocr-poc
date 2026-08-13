@@ -3,7 +3,11 @@
 종이에 손으로 쓴 TOPIK 답안을 촬영해 텍스트로 바꾸는 실험. 재타이핑 구간을 OCR 로 대체하는 것이 목표.
 
 - 레포: https://github.com/jubyeong-kim/topik-ocr-poc
-- 문제 정의서: `PROBLEM.md` · 상용화 제안서: `NEXT_STEPS.md` · 결과: `README.md`
+- `README.md` 결론 요약 · `EXPERIMENTS.md` 실험 상세 · `PROBLEM.md` 문제 정의서
+  · `NEXT_STEPS.md` 상용화 제안서 · `RETROSPECTIVE.md` 회고
+
+> README 는 **결론만** 간결하게 유지한다. 새 실험의 상세 기록은 `EXPERIMENTS.md` 에 덧붙이고,
+> README 에는 결과가 바뀐 경우에만 반영한다 (한때 782줄까지 부풀어 재구성한 이력이 있다).
 
 **이 PoC 의 산출물은 "동작하는 기능"이 아니라 재사용 가능한 평가 파이프라인이다.**
 엔진을 갈아끼우고 같은 기준으로 재측정하는 것이 핵심 가치다.
