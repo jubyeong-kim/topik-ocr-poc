@@ -847,6 +847,98 @@ def mergetest(datadir: Path, outfile: Path):
     print(f"\n리포트 → {outfile}")
 
 
+def trimtest(datadir: Path, outfile: Path):
+    """여백 제거가 단일 페이지 인식률에 도움이 되는가.
+
+    병합에는 필수였지만(크기 제한 통과), 단일 페이지에서는 002 한 장 기준으로
+    오히려 불리해 보였다(0.040 → 0.057). 표본 1장으로는 단정할 수 없어 5장 모두 잰다.
+    두 조건을 같은 실행에서 재야 비교가 성립한다.
+    """
+    from PIL import Image
+
+    from prepare_real import text_line_bands
+
+    pages = _page_texts(datadir)
+    rows = []
+    for stem in sorted(pages):
+        src = datadir / f"{stem}_page.jpg"
+        if not src.exists():
+            print(f"  건너뜀: {src.name} 없음")
+            continue
+
+        im = Image.open(src)
+        bands = text_line_bands(im)
+        y0 = max(0, bands[0][0] - 40)
+        y1 = min(im.size[1], bands[-1][1] + 40)
+        trimmed = im.crop((0, y0, im.size[0], y1))
+
+        ref = norm(pages[stem])
+        tmp = datadir / "_trim.jpg"
+
+        full_cer = cer(ref, norm(postcorrect(clova_batch([src])[0])))
+        trimmed.save(tmp, quality=95)
+        trim_cer = cer(ref, norm(postcorrect(clova_batch([tmp])[0])))
+        tmp.unlink(missing_ok=True)
+
+        rows.append(
+            {
+                "page": stem,
+                "h_full": im.size[1],
+                "h_trim": y1 - y0,
+                "full": full_cer,
+                "trim": trim_cer,
+            }
+        )
+        r = rows[-1]
+        print(
+            f"  {stem}: 여백포함 {full_cer:.3f} → 제거 {trim_cer:.3f} "
+            f"({trim_cer - full_cer:+.3f})"
+        )
+
+    if not rows:
+        sys.exit("측정할 페이지가 없습니다.")
+
+    n = len(rows)
+    avg_f = sum(r["full"] for r in rows) / n
+    avg_t = sum(r["trim"] for r in rows) / n
+    better = sum(1 for r in rows if r["trim"] < r["full"])
+
+    lines = [
+        "# 여백 제거가 단일 페이지 인식률에 미치는 영향",
+        "",
+        "병합에는 여백 제거가 필수였다(8000px 제한 통과). 그러나 단일 페이지에서도",
+        "도움이 되는지는 별개 문제이므로 5페이지를 같은 실행에서 두 조건으로 측정했다.",
+        "",
+        "| 페이지 | 높이(포함→제거) | 여백 포함 CER | 여백 제거 CER | 차이 |",
+        "|--------|-----------------|---------------|---------------|------|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['page']} | {r['h_full']}→{r['h_trim']} | {r['full']:.3f} "
+            f"| {r['trim']:.3f} | {r['trim'] - r['full']:+.3f} |"
+        )
+    lines += [
+        "",
+        f"| **평균** | | **{avg_f:.3f}** | **{avg_t:.3f}** | **{avg_t - avg_f:+.3f}** |",
+        "",
+        f"여백 제거가 더 나은 경우: **{better}/{n}**",
+        "",
+        "## 해석",
+        "",
+        (
+            "여백 제거가 **불리**하다. 여백이 레이아웃 분석에 단서를 주는 것으로 보인다."
+            if avg_t > avg_f
+            else "여백 제거가 **유리**하거나 무해하다."
+        ),
+    ]
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    outfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    print(f"\n평균 CER  여백포함 {avg_f:.3f} vs 제거 {avg_t:.3f}")
+    print(f"제거가 유리: {better}/{n}")
+    print(f"리포트 → {outfile}")
+
+
 def batchtest(datadir: Path, outfile: Path):
     """CLOVA: 페이지 5장을 한 요청(images 배열)으로 보내 개별 호출과 비교.
 
@@ -1028,6 +1120,10 @@ if __name__ == "__main__":
         "--engine", choices=["easyocr", "surya", "clova", "paddle"], default="clova"
     )
 
+    tt = sub.add_parser("trimtest", help="여백 제거가 단일 페이지에 도움 되는지")
+    tt.add_argument("--data", type=Path, default=ROOT / "data" / "real")
+    tt.add_argument("--out", type=Path, default=ROOT / "results" / "trimtest_clova.md")
+
     bt = sub.add_parser("batchtest", help="CLOVA: 여러 장을 1회 요청으로 (images 배열)")
     bt.add_argument("--data", type=Path, default=ROOT / "data" / "real")
     bt.add_argument("--out", type=Path, default=ROOT / "results" / "batchtest_clova.md")
@@ -1045,6 +1141,8 @@ if __name__ == "__main__":
         run(a.data, a.out, a.engine)
     elif a.cmd == "pagecompare":
         pagecompare(a.data, a.lines, a.out, a.engine)
+    elif a.cmd == "trimtest":
+        trimtest(a.data, a.out)
     elif a.cmd == "batchtest":
         batchtest(a.data, a.out)
     elif a.cmd == "mergetest":
